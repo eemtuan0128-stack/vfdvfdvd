@@ -3,7 +3,7 @@ name: Nexus CLI (3 nodes, persist state)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */5 * * *"   # chạy mỗi 5 giờ
+    - cron: "0 */5 * * *"
 
 permissions:
   contents: read
@@ -15,17 +15,16 @@ env:
 jobs:
   nexus:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # < 6h để còn thời gian upload state
+    timeout-minutes: 355
 
     steps:
-      - name: Checkout (optional)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Tải state từ lần chạy trước (nếu có)
       - name: Download previous state artifact
         uses: dawidd6/action-download-artifact@v6
         with:
-          workflow: nexus-persist.yml
+          workflow: main.yml
           name: nexus-state
           path: /tmp/nexus-state
           if_no_artifact_found: ignore
@@ -35,7 +34,6 @@ jobs:
           set -euxo pipefail
           sudo mkdir -p /opt/state
           sudo chown -R "$USER:$USER" /opt/state
-          # Giải nén nếu có
           if [ -f /tmp/nexus-state/home-runner-nexus.tar.gz ]; then
             tar -xzf /tmp/nexus-state/home-runner-nexus.tar.gz -C "$HOME"
           fi
@@ -51,12 +49,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y tmux curl
 
-      # 2) Cài Nexus CLI theo đúng lệnh bạn yêu cầu
       - name: Install Nexus CLI
         run: |
           set -euxo pipefail
           curl https://cli.nexus.xyz/ | sh
-          # Thêm vào PATH cho các step tiếp theo
           echo "$HOME/.nexus/bin" >> "$GITHUB_PATH"
 
       - name: Verify nexus-network path
@@ -64,7 +60,6 @@ jobs:
         run: |
           set -euxo pipefail
           if ! command -v nexus-network >/dev/null 2>&1; then
-            # fallback: thử tìm trong home
             NEXUS_BIN=$(find "$HOME" -type f -name nexus-network 2>/dev/null | head -n1 || true)
             if [ -n "$NEXUS_BIN" ]; then
               echo "fallback=$NEXUS_BIN" >> $GITHUB_OUTPUT
@@ -76,77 +71,60 @@ jobs:
             echo "fallback=" >> $GITHUB_OUTPUT
           fi
 
-      # 3) Tạo/giữ script start (nếu bạn muốn thêm lệnh bổ sung thì sửa file này)
       - name: Ensure start script exists
         run: |
           set -euxo pipefail
           if [ ! -f /opt/state/start-nexus.sh ]; then
-            cat >/opt/state/start-nexus.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
+            cat > /opt/state/start-nexus.sh <<'EOF'
+            #!/usr/bin/env bash
+            set -euo pipefail
 
-NODE_ID="$1"
-LOG_DIR="/opt/state/logs"
-mkdir -p "$LOG_DIR"
+            NODE_ID="$1"
+            LOG_DIR="/opt/state/logs"
+            mkdir -p "$LOG_DIR"
 
-# Chạy trong shell login để nạp PATH như khi 'exec bash'
-bash -lc "
-  mkdir -p \"$LOG_DIR\"
-  # In ra version cho dễ debug
-  command -v nexus-network && nexus-network --version || true
-  # Chạy node, ghi log, tự khởi động lại nếu tiến trình exit
-  while true; do
-    echo \"[\$(date -Is)] starting node \$NODE_ID\"
-    nexus-network start --node-id \"\$NODE_ID\" 2>&1 | tee -a \"$LOG_DIR/node\$NODE_ID.log\"
-    echo \"[\$(date -Is)] node \$NODE_ID exited, restart in 15s...\"
-    sleep 15
-  done
-"
-EOF
+            bash -lc "
+              command -v nexus-network && nexus-network --version || true
+              while true; do
+                echo \"[$(date -Is)] starting node $NODE_ID\"
+                nexus-network start --node-id \"$NODE_ID\" 2>&1 | tee -a \"$LOG_DIR/node$NODE_ID.log\"
+                echo \"[$(date -Is)] node $NODE_ID exited, restart in 15s...\"
+                sleep 15
+              done
+            "
+            EOF
             chmod +x /opt/state/start-nexus.sh
           fi
 
-      # 4) Khởi chạy 3 node trong 3 session tmux
       - name: Start 3 Nexus nodes in tmux
         run: |
           set -euxo pipefail
-          # Nếu step Verify trả về đường dẫn fallback thì add tạm vào PATH cho step này
           if [ -n "${{ steps.which.outputs.fallback }}" ]; then
             export PATH="$(dirname "${{ steps.which.outputs.fallback }}"):$PATH"
           fi
-
-          # Dừng session cũ nếu trùng tên (tránh nhân bản sau khi restore)
           for ID in $NODE_IDS; do
             tmux has-session -t "node${ID}" 2>/dev/null && tmux kill-session -t "node${ID}" || true
           done
-
-          # Tạo session mới
           for ID in $NODE_IDS; do
             tmux new-session -d -s "node${ID}" "/opt/state/start-nexus.sh ${ID}"
           done
-
           tmux ls || true
 
-      # 5) (tuỳ chọn) Mở SSH debug khi chạy thủ công
       - name: Open tmate (manual only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: mxschmitt/action-tmate@v3
         with:
           limit-access-to-actor: false
 
-      # 6) Cho tiến trình chạy ~5h50' rồi snapshot state
       - name: Let it run
         run: |
           sleep $((5*60*60 + 50*60))
 
-      # 7) Gói và upload lại state cho lần sau
       - name: Create state archives
         run: |
           set -euxo pipefail
           mkdir -p /tmp/state-bundle
-          # Lưu ~/.nexus (CLI, config, v.v.)
           tar -czf /tmp/state-bundle/home-runner-nexus.tar.gz -C "$HOME" .nexus || true
-          # Lưu /opt/state (script, logs,…)
           sudo tar -czf /tmp/state-bundle/opt-state.tar.gz -C / opt/state
           sudo chown "$USER:$USER" /tmp/state-bundle/*.tar.gz
 
